@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"log"
 	"time"
 )
 
@@ -23,14 +24,20 @@ type MultiLevelConfig struct {
 	// WarmupTTL is the TTL applied when populating L1 from an L2 hit.
 	// Defaults to 5 minutes when zero.
 	WarmupTTL time.Duration
+	// L1DefaultTTL is used when SetTTLOptions do not specify an L1 TTL.
+	L1DefaultTTL time.Duration
+	// L2DefaultTTL is used when SetTTLOptions do not specify an L2 TTL.
+	L2DefaultTTL time.Duration
 }
 
 // MultiLevelCache composes an L1 and L2 cache with cache-aside semantics.
 type MultiLevelCache struct {
-	l1         RawCache
-	l2         RawCache
-	serializer Serializer
-	warmupTTL  time.Duration
+	l1           RawCache
+	l2           RawCache
+	serializer   Serializer
+	warmupTTL    time.Duration
+	l1DefaultTTL time.Duration
+	l2DefaultTTL time.Duration
 }
 
 // NewMultiLevelCache builds a MultiLevelCache with sensible defaults.
@@ -44,11 +51,23 @@ func NewMultiLevelCache(l1 RawCache, l2 RawCache, serializer Serializer, cfg Mul
 		warmTTL = 5 * time.Minute
 	}
 
+	l1TTL := cfg.L1DefaultTTL
+	if l1TTL <= 0 {
+		l1TTL = 5 * time.Minute
+	}
+
+	l2TTL := cfg.L2DefaultTTL
+	if l2TTL <= 0 {
+		l2TTL = 5 * time.Minute
+	}
+
 	return &MultiLevelCache{
-		l1:         l1,
-		l2:         l2,
-		serializer: serializer,
-		warmupTTL:  warmTTL,
+		l1:           l1,
+		l2:           l2,
+		serializer:   serializer,
+		warmupTTL:    warmTTL,
+		l1DefaultTTL: l1TTL,
+		l2DefaultTTL: l2TTL,
 	}, nil
 }
 
@@ -62,6 +81,7 @@ func (m *MultiLevelCache) Get(ctx context.Context, key string, dest any) (bool, 
 		if data, ok, err := m.l1.Get(ctx, key); err != nil {
 			return false, err
 		} else if ok {
+			log.Printf("[cache] hit level=L1 key=%s", key)
 			return true, m.serializer.Unmarshal(data, dest)
 		}
 	}
@@ -75,6 +95,7 @@ func (m *MultiLevelCache) Get(ctx context.Context, key string, dest any) (bool, 
 		return false, err
 	}
 	if !ok {
+		log.Printf("[cache] miss key=%s", key)
 		return false, nil
 	}
 
@@ -82,6 +103,7 @@ func (m *MultiLevelCache) Get(ctx context.Context, key string, dest any) (bool, 
 		return false, err
 	}
 
+	log.Printf("[cache] hit level=L2 key=%s (warming L1)", key)
 	if m.l1 != nil {
 		// best-effort warmup; ignore errors to avoid failing the request.
 		_ = m.l1.Set(ctx, key, data, m.warmupTTL)
@@ -91,7 +113,7 @@ func (m *MultiLevelCache) Get(ctx context.Context, key string, dest any) (bool, 
 }
 
 // Set serializes value and persists to both cache levels.
-func (m *MultiLevelCache) Set(ctx context.Context, key string, value any, ttl time.Duration) error {
+func (m *MultiLevelCache) Set(ctx context.Context, key string, value any, opts SetTTLOptions) error {
 	if m == nil {
 		return errors.New("cache not initialized")
 	}
@@ -101,14 +123,16 @@ func (m *MultiLevelCache) Set(ctx context.Context, key string, value any, ttl ti
 		return err
 	}
 
+	l1TTL, l2TTL := opts.normalize(m.l1DefaultTTL, m.l2DefaultTTL)
+
 	if m.l1 != nil {
-		if err := m.l1.Set(ctx, key, data, ttl); err != nil {
+		if err := m.l1.Set(ctx, key, data, l1TTL); err != nil {
 			return err
 		}
 	}
 
 	if m.l2 != nil {
-		if err := m.l2.Set(ctx, key, data, ttl); err != nil {
+		if err := m.l2.Set(ctx, key, data, l2TTL); err != nil {
 			return err
 		}
 	}
@@ -127,12 +151,16 @@ func (m *MultiLevelCache) Delete(ctx context.Context, key string) error {
 	if m.l1 != nil {
 		if err := m.l1.Delete(ctx, key); err != nil {
 			firstErr = err
+		} else {
+			log.Printf("[cache] delete level=L1 key=%s", key)
 		}
 	}
 
 	if m.l2 != nil {
 		if err := m.l2.Delete(ctx, key); err != nil && firstErr == nil {
 			firstErr = err
+		} else if err == nil {
+			log.Printf("[cache] delete level=L2 key=%s", key)
 		}
 	}
 

@@ -36,7 +36,11 @@ func TestIntegrationMultiLevelCacheWithRedis(t *testing.T) {
 	l2, err := NewRedisCache(client)
 	require.NoError(t, err)
 
-	ml, err := NewMultiLevelCache(l1, l2, JSONSerializer{}, MultiLevelConfig{WarmupTTL: time.Second})
+	ml, err := NewMultiLevelCache(l1, l2, JSONSerializer{}, MultiLevelConfig{
+		WarmupTTL:    time.Second,
+		L1DefaultTTL: time.Second,
+		L2DefaultTTL: time.Second,
+	})
 	require.NoError(t, err)
 
 	key := "integration:user"
@@ -47,7 +51,10 @@ func TestIntegrationMultiLevelCacheWithRedis(t *testing.T) {
 	}
 
 	value := user{Name: "cached"}
-	require.NoError(t, ml.Set(ctx, key, value, 200*time.Millisecond))
+	require.NoError(t, ml.Set(ctx, key, value, SetTTLOptions{
+		L1TTL: 200 * time.Millisecond,
+		L2TTL: 200 * time.Millisecond,
+	}))
 
 	var out user
 	found, err := ml.Get(ctx, key, &out)

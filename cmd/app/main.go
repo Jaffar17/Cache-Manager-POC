@@ -18,8 +18,6 @@ import (
 	"go-cache-poc/internal/db"
 )
 
-const defaultTTL = 5 * time.Minute
-
 func main() {
 	ctx := context.Background()
 
@@ -32,6 +30,10 @@ func main() {
 		log.Fatalf("failed creating bigcache: %v", err)
 	}
 	defer bigCache.Close()
+
+	l1TTL := getenvDuration("CACHE_L1_TTL", time.Minute)
+	l2TTL := getenvDuration("CACHE_L2_TTL", 5*time.Minute)
+	warmTTL := getenvDuration("CACHE_WARM_TTL", l1TTL)
 
 	redisAddr := getenv("REDIS_ADDR", "localhost:6379")
 	redisClient := redis.NewClient(&redis.Options{Addr: redisAddr})
@@ -46,7 +48,11 @@ func main() {
 	}
 
 	serializer := cache.JSONSerializer{}
-	multiLevel, err := NewAppCache(bigCache, redisCache, serializer)
+	multiLevel, err := NewAppCache(bigCache, redisCache, serializer, cache.MultiLevelConfig{
+		WarmupTTL:    warmTTL,
+		L1DefaultTTL: l1TTL,
+		L2DefaultTTL: l2TTL,
+	})
 	if err != nil {
 		log.Fatalf("failed constructing cache: %v", err)
 	}
@@ -62,7 +68,11 @@ func main() {
 		log.Fatalf("failed initializing database: %v", err)
 	}
 
-	srv := &server{cache: multiLevel, db: store}
+	srv := &server{
+		cache:             multiLevel,
+		db:                store,
+		defaultSetOptions: cache.SetTTLOptions{L1TTL: l1TTL, L2TTL: l2TTL},
+	}
 
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
@@ -76,7 +86,12 @@ func main() {
 	}
 }
 
-func NewAppCache(l1 *cache.BigCache, l2 *cache.RedisCache, serializer cache.Serializer) (cache.Cache, error) {
+func NewAppCache(
+	l1 *cache.BigCache,
+	l2 *cache.RedisCache,
+	serializer cache.Serializer,
+	cfg cache.MultiLevelConfig) (cache.Cache, error) {
+
 	var l1Raw cache.RawCache
 	var l2Raw cache.RawCache
 	if l1 != nil {
@@ -85,12 +100,13 @@ func NewAppCache(l1 *cache.BigCache, l2 *cache.RedisCache, serializer cache.Seri
 	if l2 != nil {
 		l2Raw = l2
 	}
-	return cache.NewMultiLevelCache(l1Raw, l2Raw, serializer, cache.MultiLevelConfig{WarmupTTL: defaultTTL})
+	return cache.NewMultiLevelCache(l1Raw, l2Raw, serializer, cfg)
 }
 
 type server struct {
-	cache cache.Cache
-	db    *db.Store
+	cache             cache.Cache
+	db                *db.Store
+	defaultSetOptions cache.SetTTLOptions
 }
 
 func (s *server) handleGetUser(c *gin.Context) {
@@ -120,7 +136,7 @@ func (s *server) handleGetUser(c *gin.Context) {
 			return
 		}
 
-		if err := s.cache.Set(ctx, cacheKey, user, defaultTTL); err != nil {
+		if err := s.cache.Set(ctx, cacheKey, user, s.defaultSetOptions); err != nil {
 			log.Printf("warn: failed setting cache: %v", err)
 		}
 	}
@@ -168,6 +184,16 @@ func writeError(c *gin.Context, status int, err error) {
 func getenv(key, fallback string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
+	}
+	return fallback
+}
+
+func getenvDuration(key string, fallback time.Duration) time.Duration {
+	if val := os.Getenv(key); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			return d
+		}
+		log.Printf("warn: invalid duration for %s=%s, using fallback %s", key, val, fallback)
 	}
 	return fallback
 }
