@@ -179,7 +179,6 @@ func decodeEntry(raw []byte) ([]byte, bool) {
 		return nil, false
 	}
 	expiry := int64(binary.LittleEndian.Uint64(raw[:8]))
-	// TODO: Rethink about this as if its nearing expiry, we have to think before serving
 	if expiry > 0 && time.Now().UnixNano() > expiry {
 		return nil, false
 	}

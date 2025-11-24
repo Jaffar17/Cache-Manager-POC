@@ -5,6 +5,18 @@ import (
 	"time"
 )
 
+// CacheMode defines the default caching strategy for the cache instance.
+type CacheMode int
+
+const (
+	// ModeBothLevels writes to both L1 and L2 by default, with warmup enabled.
+	ModeBothLevels CacheMode = iota
+	// ModeL1Only writes only to L1 by default.
+	ModeL1Only
+	// ModeL2Only writes only to L2 by default, with warmup disabled.
+	ModeL2Only
+)
+
 // Cache represents the multi-level cache facade exposed to callers.
 type Cache interface {
 	Get(ctx context.Context, key string, dest any) (bool, error)
@@ -12,10 +24,12 @@ type Cache interface {
 	Delete(ctx context.Context, key string) error
 }
 
-// SetTTLOptions controls TTL behavior for cache writes.
+// SetTTLOptions controls TTL behavior and target levels for cache writes.
 type SetTTLOptions struct {
-	L1TTL time.Duration
-	L2TTL time.Duration
+	L1TTL    time.Duration
+	L2TTL    time.Duration
+	TargetL1 *bool // nil = use mode default, true/false = override
+	TargetL2 *bool // nil = use mode default, true/false = override
 }
 
 // This function takes the per-call options and makes sure both layers end up with a valid duration
