@@ -31,8 +31,8 @@ func main() {
 	}
 	defer bigCache.Close()
 
-	l1TTL := getenvDuration("CACHE_L1_TTL", time.Minute)
-	l2TTL := getenvDuration("CACHE_L2_TTL", 5*time.Minute)
+	l1TTL := getenvDuration("CACHE_L1_TTL", 40*time.Second)
+	l2TTL := getenvDuration("CACHE_L2_TTL", 2*time.Minute)
 	warmTTL := getenvDuration("CACHE_WARM_TTL", l1TTL)
 
 	redisAddr := getenv("REDIS_ADDR", "localhost:6379")
@@ -48,14 +48,35 @@ func main() {
 	}
 
 	serializer := cache.JSONSerializer{}
-	multiLevel, err := NewAppCache(bigCache, redisCache, serializer, cache.MultiLevelConfig{
+
+	// Create cache instances with different modes for testing
+	cacheBothLevels, err := cache.NewMultiLevelCache(bigCache, redisCache, serializer, cache.MultiLevelConfig{
+		Mode:         cache.ModeBothLevels,
 		WarmupTTL:    warmTTL,
 		L1DefaultTTL: l1TTL,
 		L2DefaultTTL: l2TTL,
 	})
 	if err != nil {
-		log.Fatalf("failed constructing cache: %v", err)
+		log.Fatalf("failed constructing both-levels cache: %v", err)
 	}
+
+	cacheL1Only, err := cache.NewMultiLevelCache(bigCache, nil, serializer, cache.MultiLevelConfig{
+		Mode:         cache.ModeL1Only,
+		L1DefaultTTL: l1TTL,
+	})
+	if err != nil {
+		log.Fatalf("failed constructing L1-only cache: %v", err)
+	}
+
+	cacheL2Only, err := cache.NewMultiLevelCache(nil, redisCache, serializer, cache.MultiLevelConfig{
+		Mode:         cache.ModeL2Only,
+		L2DefaultTTL: l2TTL,
+	})
+	if err != nil {
+		log.Fatalf("failed constructing L2-only cache: %v", err)
+	}
+
+	log.Println("✓ Configured 3 cache instances: both-levels, L1-only, L2-only")
 
 	postgresDSN := getenv("POSTGRES_DSN", "postgres://app:app@localhost:5432/app?sslmode=disable")
 	store, err := db.NewStore(ctx, postgresDSN)
@@ -69,47 +90,88 @@ func main() {
 	}
 
 	srv := &server{
-		cache:             multiLevel,
-		db:                store,
-		defaultSetOptions: cache.SetTTLOptions{L1TTL: l1TTL, L2TTL: l2TTL},
+		cacheBothLevels: cacheBothLevels,
+		cacheL1Only:     cacheL1Only,
+		cacheL2Only:     cacheL2Only,
+		db:              store,
+		l1TTL:           l1TTL,
+		l2TTL:           l2TTL,
 	}
 
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
 
+	// Standard endpoints (both levels)
 	router.GET("/users/:id", srv.handleGetUser)
 	router.POST("/users/refresh/:id", srv.handleRefreshUser)
 
+	// Mode-specific endpoints
+	router.GET("/users/l1-only/:id", srv.handleGetUserL1Only)
+	router.GET("/users/l2-only/:id", srv.handleGetUserL2Only)
+	router.GET("/users/both-levels/:id", srv.handleGetUserBothLevels)
+
+	// Per-call override endpoints (using cacheBothLevels with overrides)
+	router.GET("/users/override-l1/:id", srv.handleGetUserOverrideL1)
+	router.GET("/users/override-l2/:id", srv.handleGetUserOverrideL2)
+	router.POST("/users/set-l1-only/:id", srv.handleSetUserL1Only)
+	router.POST("/users/set-l2-only/:id", srv.handleSetUserL2Only)
+
+	// Cache inspection endpoints
+	router.GET("/cache/stats/:id", srv.handleCacheStats)
+	router.DELETE("/cache/clear/:id", srv.handleClearCache)
+
+	log.Println("✓ Server configured with multiple cache mode endpoints")
+	log.Println("  Standard: GET /users/:id, POST /users/refresh/:id")
+	log.Println("  Mode-specific: GET /users/{l1-only,l2-only,both-levels}/:id")
+	log.Println("  Overrides: GET /users/override-{l1,l2}/:id, POST /users/set-{l1,l2}-only/:id")
+	log.Println("  Inspection: GET /cache/stats/:id, DELETE /cache/clear/:id")
 	log.Println("server listening on :8080")
 	if err := router.Run(":8080"); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
 
-func NewAppCache(
-	l1 *cache.BigCache,
-	l2 *cache.RedisCache,
-	serializer cache.Serializer,
-	cfg cache.MultiLevelConfig) (cache.Cache, error) {
-
-	var l1Raw cache.RawCache
-	var l2Raw cache.RawCache
-	if l1 != nil {
-		l1Raw = l1
-	}
-	if l2 != nil {
-		l2Raw = l2
-	}
-	return cache.NewMultiLevelCache(l1Raw, l2Raw, serializer, cfg)
-}
-
 type server struct {
-	cache             cache.Cache
-	db                *db.Store
-	defaultSetOptions cache.SetTTLOptions
+	cacheBothLevels cache.Cache
+	cacheL1Only     cache.Cache
+	cacheL2Only     cache.Cache
+	db              *db.Store
+	l1TTL           time.Duration
+	l2TTL           time.Duration
 }
 
+// Standard endpoint - uses both levels cache
 func (s *server) handleGetUser(c *gin.Context) {
+	s.getUserWithCache(c, s.cacheBothLevels, "both-levels", cache.SetTTLOptions{
+		L1TTL: s.l1TTL,
+		L2TTL: s.l2TTL,
+	})
+}
+
+// L1 only mode endpoint
+func (s *server) handleGetUserL1Only(c *gin.Context) {
+	s.getUserWithCache(c, s.cacheL1Only, "L1-only", cache.SetTTLOptions{
+		L1TTL: s.l1TTL,
+	})
+}
+
+// L2 only mode endpoint
+func (s *server) handleGetUserL2Only(c *gin.Context) {
+	s.getUserWithCache(c, s.cacheL2Only, "L2-only", cache.SetTTLOptions{
+		L2TTL: s.l2TTL,
+	})
+}
+
+// Both levels mode endpoint (explicit)
+func (s *server) handleGetUserBothLevels(c *gin.Context) {
+	s.getUserWithCache(c, s.cacheBothLevels, "both-levels-explicit", cache.SetTTLOptions{
+		L1TTL: 20 * time.Second,
+		L2TTL: 40 * time.Second,
+	})
+}
+
+// Override to L1 only (using both-levels cache with per-call override)
+func (s *server) handleGetUserOverrideL1(c *gin.Context) {
 	ctx := c.Request.Context()
 	id, err := parseID(c.Param("id"))
 	if err != nil {
@@ -119,7 +181,7 @@ func (s *server) handleGetUser(c *gin.Context) {
 
 	cacheKey := userCacheKey(id)
 	var user db.User
-	found, err := s.cache.Get(ctx, cacheKey, &user)
+	found, err := s.cacheBothLevels.Get(ctx, cacheKey, &user)
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, err)
 		return
@@ -136,12 +198,106 @@ func (s *server) handleGetUser(c *gin.Context) {
 			return
 		}
 
-		if err := s.cache.Set(ctx, cacheKey, user, s.defaultSetOptions); err != nil {
-			log.Printf("warn: failed setting cache: %v", err)
+		// Override: write only to L1
+		if err := s.cacheBothLevels.Set(ctx, cacheKey, user, cache.SetTTLOptions{
+			L1TTL:    s.l1TTL,
+			TargetL1: cache.BoolPtr(true),
+			TargetL2: cache.BoolPtr(false),
+		}); err != nil {
+			log.Printf("warn: failed setting cache (L1 override): %v", err)
 		}
 	}
 
-	c.JSON(http.StatusOK, user)
+	c.JSON(http.StatusOK, gin.H{
+		"user":       user,
+		"cache_mode": "override-L1-only",
+		"from_cache": found,
+	})
+}
+
+// Override to L2 only (using both-levels cache with per-call override)
+func (s *server) handleGetUserOverrideL2(c *gin.Context) {
+	ctx := c.Request.Context()
+	id, err := parseID(c.Param("id"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err)
+		return
+	}
+
+	cacheKey := userCacheKey(id)
+	var user db.User
+	found, err := s.cacheBothLevels.Get(ctx, cacheKey, &user)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, err)
+		return
+	}
+
+	if !found {
+		user, err = s.db.GetUser(ctx, id)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, db.ErrUserNotFound) {
+				status = http.StatusNotFound
+			}
+			writeError(c, status, err)
+			return
+		}
+
+		// Override: write only to L2
+		if err := s.cacheBothLevels.Set(ctx, cacheKey, user, cache.SetTTLOptions{
+			L2TTL:    s.l2TTL,
+			TargetL1: cache.BoolPtr(false),
+			TargetL2: cache.BoolPtr(true),
+		}); err != nil {
+			log.Printf("warn: failed setting cache (L2 override): %v", err)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"user":       user,
+		"cache_mode": "override-L2-only",
+		"from_cache": found,
+	})
+}
+
+// Helper function for standard get operations
+func (s *server) getUserWithCache(c *gin.Context, cacheInstance cache.Cache, mode string, opts cache.SetTTLOptions) {
+	ctx := c.Request.Context()
+	id, err := parseID(c.Param("id"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err)
+		return
+	}
+
+	cacheKey := userCacheKey(id)
+	var user db.User
+	found, err := cacheInstance.Get(ctx, cacheKey, &user)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, err)
+		return
+	}
+
+	if !found {
+		user, err = s.db.GetUser(ctx, id)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, db.ErrUserNotFound) {
+				status = http.StatusNotFound
+			}
+			writeError(c, status, err)
+			return
+		}
+
+		if err := cacheInstance.Set(ctx, cacheKey, user, opts); err != nil {
+			log.Printf("warn: failed setting cache (%s): %v", mode, err)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"user":       user,
+		"cache_mode": mode,
+		"from_cache": found,
+	})
 }
 
 func (s *server) handleRefreshUser(c *gin.Context) {
@@ -162,11 +318,137 @@ func (s *server) handleRefreshUser(c *gin.Context) {
 		return
 	}
 
-	if err := s.cache.Delete(ctx, userCacheKey(id)); err != nil {
-		log.Printf("warn: failed deleting cache: %v", err)
+	// Clear from all cache instances
+	cacheKey := userCacheKey(id)
+	if err := s.cacheBothLevels.Delete(ctx, cacheKey); err != nil {
+		log.Printf("warn: failed deleting from both-levels cache: %v", err)
+	}
+	if err := s.cacheL1Only.Delete(ctx, cacheKey); err != nil {
+		log.Printf("warn: failed deleting from L1-only cache: %v", err)
+	}
+	if err := s.cacheL2Only.Delete(ctx, cacheKey); err != nil {
+		log.Printf("warn: failed deleting from L2-only cache: %v", err)
 	}
 
 	c.JSON(http.StatusOK, user)
+}
+
+// Set user in L1 only
+func (s *server) handleSetUserL1Only(c *gin.Context) {
+	ctx := c.Request.Context()
+	id, err := parseID(c.Param("id"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err)
+		return
+	}
+
+	user, err := s.db.GetUser(ctx, id)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, db.ErrUserNotFound) {
+			status = http.StatusNotFound
+		}
+		writeError(c, status, err)
+		return
+	}
+
+	cacheKey := userCacheKey(id)
+	if err := s.cacheBothLevels.Set(ctx, cacheKey, user, cache.SetTTLOptions{
+		L1TTL:    s.l1TTL,
+		TargetL1: cache.BoolPtr(true),
+		TargetL2: cache.BoolPtr(false),
+	}); err != nil {
+		writeError(c, http.StatusInternalServerError, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "User cached in L1 only",
+		"user":    user,
+	})
+}
+
+// Set user in L2 only
+func (s *server) handleSetUserL2Only(c *gin.Context) {
+	ctx := c.Request.Context()
+	id, err := parseID(c.Param("id"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err)
+		return
+	}
+
+	user, err := s.db.GetUser(ctx, id)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, db.ErrUserNotFound) {
+			status = http.StatusNotFound
+		}
+		writeError(c, status, err)
+		return
+	}
+
+	cacheKey := userCacheKey(id)
+	if err := s.cacheBothLevels.Set(ctx, cacheKey, user, cache.SetTTLOptions{
+		L2TTL:    s.l2TTL,
+		TargetL1: cache.BoolPtr(false),
+		TargetL2: cache.BoolPtr(true),
+	}); err != nil {
+		writeError(c, http.StatusInternalServerError, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "User cached in L2 only",
+		"user":    user,
+	})
+}
+
+// Get cache stats for a user
+func (s *server) handleCacheStats(c *gin.Context) {
+	ctx := c.Request.Context()
+	id, err := parseID(c.Param("id"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err)
+		return
+	}
+
+	cacheKey := userCacheKey(id)
+
+	var userBoth, userL1, userL2 db.User
+	foundBoth, _ := s.cacheBothLevels.Get(ctx, cacheKey, &userBoth)
+	foundL1, _ := s.cacheL1Only.Get(ctx, cacheKey, &userL1)
+	foundL2, _ := s.cacheL2Only.Get(ctx, cacheKey, &userL2)
+
+	c.JSON(http.StatusOK, gin.H{
+		"cache_key":   cacheKey,
+		"both_levels": gin.H{"cached": foundBoth},
+		"l1_only":     gin.H{"cached": foundL1},
+		"l2_only":     gin.H{"cached": foundL2},
+	})
+}
+
+// Clear cache for a user from all instances
+func (s *server) handleClearCache(c *gin.Context) {
+	ctx := c.Request.Context()
+	id, err := parseID(c.Param("id"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err)
+		return
+	}
+
+	cacheKey := userCacheKey(id)
+
+	errBoth := s.cacheBothLevels.Delete(ctx, cacheKey)
+	errL1 := s.cacheL1Only.Delete(ctx, cacheKey)
+	errL2 := s.cacheL2Only.Delete(ctx, cacheKey)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":     "Cache cleared",
+		"cache_key":   cacheKey,
+		"both_levels": errBoth == nil,
+		"l1_only":     errL1 == nil,
+		"l2_only":     errL2 == nil,
+	})
 }
 
 func parseID(idParam string) (int, error) {
