@@ -26,7 +26,9 @@ type BigCacheConfig struct {
 func NewBigCache(cfg BigCacheConfig) (*BigCache, error) {
 	config := cfg.Config
 	if config.LifeWindow == 0 {
-		config = bigcache.DefaultConfig(10 * time.Minute)
+		config.LifeWindow = 10 * time.Minute
+	}
+	if config.CleanWindow == 0 {
 		config.CleanWindow = time.Minute
 	}
 
